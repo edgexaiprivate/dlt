@@ -1,0 +1,339 @@
+##############################################################################
+# MenuVision — Main CI Pipeline
+# Triggers: every push to any branch, every PR to main/develop
+#
+# Stages (sequential — any failure stops the pipeline):
+#   1. lint-and-type   → Ruff (Python) + ESLint/TSC (frontend)
+#   2. unit-tests      → pytest unit layer, coverage enforced
+#   3. integration-tests → pytest integration layer with SQLite
+#   4. security-scan   → Bandit (SAST) + pip-audit (deps)
+#   5. frontend-build  → npm build (ensures no TS errors)
+#   6. docker-build    → verify images build cleanly
+##############################################################################
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # STAGE 1 — Lint & Type Check
+  # ─────────────────────────────────────────────────────────────────────────
+  lint-and-type:
+    name: "1 · Lint & Type"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Python lint
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Python lint tools
+        run: pip install ruff mypy types-passlib
+
+      - name: Ruff lint (Python)
+        working-directory: backend
+        run: ruff check app/ tests/ --output-format=github
+
+      - name: Ruff format check
+        working-directory: backend
+        run: ruff format app/ tests/ --check
+
+      # Frontend lint
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend-admin/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: frontend-admin
+        run: npm ci
+
+      - name: TypeScript check
+        working-directory: frontend-admin
+        run: npx tsc --noEmit
+
+      - name: ESLint
+        working-directory: frontend-admin
+        run: npm run lint -- --max-warnings 0
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # STAGE 2 — Unit Tests
+  # ─────────────────────────────────────────────────────────────────────────
+  unit-tests:
+    name: "2 · Unit Tests"
+    runs-on: ubuntu-latest
+    needs: lint-and-type
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run unit tests
+        working-directory: backend
+        env:
+          DATABASE_URL: "sqlite+aiosqlite:///:memory:"
+          SECRET_KEY: "test-secret-key-for-ci-only-32ch"
+          ENVIRONMENT: "test"
+        run: |
+          pytest tests/unit/ \
+            -v \
+            --tb=short \
+            --cov=app \
+            --cov-report=xml:coverage-unit.xml \
+            --cov-report=term-missing \
+            --cov-fail-under=80 \
+            -x
+
+      - name: Upload unit coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: backend/coverage-unit.xml
+          flags: unit
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      # Frontend unit tests (Vitest)
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend-admin/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: frontend-admin
+        run: npm ci
+
+      - name: Run frontend unit tests
+        working-directory: frontend-admin
+        run: npm run test:unit -- --coverage --reporter=verbose
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # STAGE 3 — Integration Tests
+  # ─────────────────────────────────────────────────────────────────────────
+  integration-tests:
+    name: "3 · Integration Tests"
+    runs-on: ubuntu-latest
+    needs: unit-tests
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: menuvision_test
+          POSTGRES_USER: menuvision
+          POSTGRES_PASSWORD: menuvision_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run database migrations
+        working-directory: backend
+        env:
+          DATABASE_URL: "postgresql+asyncpg://menuvision:menuvision_test@localhost:5432/menuvision_test"
+          SECRET_KEY: "test-secret-key-for-ci-only-32ch"
+        run: alembic upgrade head
+
+      - name: Run integration tests
+        working-directory: backend
+        env:
+          # Tests override DB_URL with SQLite, but Redis is real
+          DATABASE_URL: "postgresql+asyncpg://menuvision:menuvision_test@localhost:5432/menuvision_test"
+          REDIS_URL: "redis://localhost:6379"
+          SECRET_KEY: "test-secret-key-for-ci-only-32ch"
+          ENVIRONMENT: "test"
+        run: |
+          pytest tests/integration/ \
+            -v \
+            --tb=short \
+            --cov=app \
+            --cov-report=xml:coverage-integration.xml \
+            --cov-fail-under=75 \
+            -x
+
+      - name: Upload integration coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: backend/coverage-integration.xml
+          flags: integration
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # STAGE 4 — Security Scan
+  # ─────────────────────────────────────────────────────────────────────────
+  security-scan:
+    name: "4 · Security Scan"
+    runs-on: ubuntu-latest
+    needs: unit-tests  # Run parallel to integration tests
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install security tools
+        run: pip install bandit[toml] pip-audit safety
+
+      - name: Bandit SAST scan (Python)
+        working-directory: backend
+        run: |
+          bandit -r app/ \
+            -c bandit.yaml \
+            -f json \
+            -o bandit-report.json \
+            --exit-zero
+          # Fail on HIGH severity findings
+          bandit -r app/ -c bandit.yaml -ll
+
+      - name: pip-audit (dependency vulnerabilities)
+        working-directory: backend
+        run: |
+          pip install -r requirements.txt --quiet
+          pip-audit --requirement requirements.txt \
+            --format json \
+            --output pip-audit-report.json \
+            --ignore-vuln PYSEC-2022-42969  # known false positive
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            backend/bandit-report.json
+            backend/pip-audit-report.json
+
+      # Frontend dependency audit
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend-admin/package-lock.json
+
+      - name: npm audit
+        working-directory: frontend-admin
+        run: npm audit --audit-level=high
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # STAGE 5 — Frontend Build
+  # ─────────────────────────────────────────────────────────────────────────
+  frontend-build:
+    name: "5 · Frontend Build"
+    runs-on: ubuntu-latest
+    needs: [integration-tests, security-scan]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend-admin/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend-admin
+        run: npm ci
+
+      - name: Build production bundle
+        working-directory: frontend-admin
+        env:
+          VITE_API_URL: "/api"
+        run: npm run build
+
+      - name: Check bundle size
+        working-directory: frontend-admin
+        run: |
+          BUNDLE_SIZE=$(du -sk dist/ | cut -f1)
+          echo "Bundle size: ${BUNDLE_SIZE}KB"
+          # Fail if bundle exceeds 5MB
+          if [ "$BUNDLE_SIZE" -gt 5120 ]; then
+            echo "❌ Bundle too large: ${BUNDLE_SIZE}KB > 5120KB"
+            exit 1
+          fi
+          echo "✅ Bundle size OK: ${BUNDLE_SIZE}KB"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend-admin/dist/
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # STAGE 6 — Docker Build Verification
+  # ─────────────────────────────────────────────────────────────────────────
+  docker-build:
+    name: "6 · Docker Build"
+    runs-on: ubuntu-latest
+    needs: [integration-tests, security-scan]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: false
+          tags: menuvision-backend:ci-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build frontend image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend-admin
+          push: false
+          tags: menuvision-frontend:ci-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

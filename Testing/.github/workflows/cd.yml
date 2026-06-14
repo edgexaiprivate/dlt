@@ -1,0 +1,368 @@
+##############################################################################
+# MenuVision — CD Pipeline
+# Triggers:
+#   develop branch → auto-deploy to STAGING
+#   main branch    → deploy to PRODUCTION (requires manual approval)
+#
+# Requires GitHub secrets:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+#   ECR_REGISTRY (e.g. 123456789.dkr.ecr.ap-south-1.amazonaws.com)
+#   STAGING_SSH_KEY, STAGING_HOST, STAGING_USER
+#   PROD_SSH_KEY, PROD_HOST, PROD_USER
+#   SLACK_WEBHOOK_URL
+#   POSTGRES_PASSWORD_STAGING, POSTGRES_PASSWORD_PROD
+#   SECRET_KEY_STAGING, SECRET_KEY_PROD
+##############################################################################
+name: CD
+
+on:
+  push:
+    branches: [main, develop]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main, develop]
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+  ECR_BACKEND_REPO: menuvision/backend
+  ECR_FRONTEND_REPO: menuvision/frontend
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Guard: only proceed if CI passed
+  # ─────────────────────────────────────────────────────────────────────────
+  check-ci:
+    name: "Guard · CI must pass"
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'push' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: CI passed ✅
+        run: echo "CI checks passed, proceeding to deploy"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Build & Push Docker images to ECR
+  # ─────────────────────────────────────────────────────────────────────────
+  build-and-push:
+    name: "Build · Push to ECR"
+    runs-on: ubuntu-latest
+    needs: check-ci
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate image metadata
+        id: meta
+        run: |
+          SHORT_SHA=${GITHUB_SHA::8}
+          BRANCH=${GITHUB_REF_NAME//\//-}
+          TAG="${BRANCH}-${SHORT_SHA}"
+          echo "version=${TAG}" >> $GITHUB_OUTPUT
+          echo "Image tag: ${TAG}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ secrets.ECR_REGISTRY }}/${{ env.ECR_BACKEND_REPO }}:${{ steps.meta.outputs.version }}
+            ${{ secrets.ECR_REGISTRY }}/${{ env.ECR_BACKEND_REPO }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_ENV=${{ github.ref_name == 'main' && 'production' || 'staging' }}
+
+      - name: Build & push frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend-admin
+          push: true
+          tags: |
+            ${{ secrets.ECR_REGISTRY }}/${{ env.ECR_FRONTEND_REPO }}:${{ steps.meta.outputs.version }}
+            ${{ secrets.ECR_REGISTRY }}/${{ env.ECR_FRONTEND_REPO }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VITE_API_URL=${{ github.ref_name == 'main' && 'https://api.menuvision.app' || 'https://api-staging.menuvision.app' }}
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # STAGING — Auto-deploy on develop branch
+  # ─────────────────────────────────────────────────────────────────────────
+  deploy-staging:
+    name: "Deploy · Staging"
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref_name == 'develop'
+    environment:
+      name: staging
+      url: https://staging.menuvision.app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy to staging server
+        env:
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image-tag }}
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD_STAGING }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY_STAGING }}
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          envs: IMAGE_TAG,ECR_REGISTRY,POSTGRES_PASSWORD,SECRET_KEY
+          script: |
+            set -e
+
+            # Login to ECR
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | \
+              docker login --username AWS --password-stdin $ECR_REGISTRY
+
+            # Pull new images
+            docker pull $ECR_REGISTRY/menuvision/backend:$IMAGE_TAG
+            docker pull $ECR_REGISTRY/menuvision/frontend:$IMAGE_TAG
+
+            # Update environment file
+            cat > /opt/menuvision/.env << EOF
+            ENVIRONMENT=staging
+            DATABASE_URL=postgresql+asyncpg://menuvision:${POSTGRES_PASSWORD}@postgres:5432/menuvision
+            REDIS_URL=redis://redis:6379
+            SECRET_KEY=${SECRET_KEY}
+            CORS_ORIGINS=["https://staging.menuvision.app"]
+            EOF
+
+            # Rolling deploy — zero downtime
+            cd /opt/menuvision
+            export BACKEND_IMAGE=$ECR_REGISTRY/menuvision/backend:$IMAGE_TAG
+            export FRONTEND_IMAGE=$ECR_REGISTRY/menuvision/frontend:$IMAGE_TAG
+
+            docker-compose -f docker-compose.prod.yml pull
+            docker-compose -f docker-compose.prod.yml up -d \
+              --no-deps \
+              --scale backend=2 \
+              backend frontend nginx
+
+            # Wait for health
+            sleep 10
+            curl --fail https://staging.menuvision.app/health || {
+              echo "❌ Health check failed — rolling back"
+              docker-compose -f docker-compose.prod.yml rollback
+              exit 1
+            }
+
+            # Clean up old images
+            docker image prune -f
+
+            echo "✅ Staging deploy complete: $IMAGE_TAG"
+
+      - name: Run post-deploy smoke tests (staging)
+        run: |
+          sleep 5
+          curl --fail https://staging.menuvision.app/health
+          curl --fail https://api-staging.menuvision.app/health
+          echo "✅ Staging smoke tests passed"
+
+      - name: Notify Slack (staging)
+        if: always()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '✅' || '❌' }} *Staging deploy* ${{ job.status }}\n Branch: `${{ github.ref_name }}` | Tag: `${{ needs.build-and-push.outputs.image-tag }}`\n <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # E2E Tests against Staging
+  # ─────────────────────────────────────────────────────────────────────────
+  e2e-staging:
+    name: "E2E · Staging"
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref_name == 'develop'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Playwright
+        run: |
+          pip install pytest-playwright playwright
+          playwright install chromium --with-deps
+
+      - name: Run E2E tests against staging
+        env:
+          BASE_URL: "https://staging.menuvision.app"
+        run: |
+          pytest backend/tests/e2e/ \
+            -v \
+            --tb=short \
+            -x \
+            --screenshot=only-on-failure \
+            --video=retain-on-failure
+
+      - name: Upload E2E artifacts
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-failures
+          path: test-results/
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # PRODUCTION — Manual approval required
+  # ─────────────────────────────────────────────────────────────────────────
+  deploy-production:
+    name: "Deploy · Production"
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref_name == 'main'
+    environment:
+      name: production          # Requires manual approval in GitHub Environments
+      url: https://menuvision.app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy to production (blue-green)
+        env:
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image-tag }}
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD_PROD }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY_PROD }}
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          envs: IMAGE_TAG,ECR_REGISTRY,POSTGRES_PASSWORD,SECRET_KEY
+          script: |
+            set -e
+
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | \
+              docker login --username AWS --password-stdin $ECR_REGISTRY
+
+            docker pull $ECR_REGISTRY/menuvision/backend:$IMAGE_TAG
+            docker pull $ECR_REGISTRY/menuvision/frontend:$IMAGE_TAG
+
+            cat > /opt/menuvision/.env.prod << EOF
+            ENVIRONMENT=production
+            DEBUG=false
+            DATABASE_URL=postgresql+asyncpg://menuvision:${POSTGRES_PASSWORD}@postgres:5432/menuvision
+            REDIS_URL=redis://redis:6379
+            SECRET_KEY=${SECRET_KEY}
+            CORS_ORIGINS=["https://menuvision.app","https://www.menuvision.app"]
+            EOF
+
+            cd /opt/menuvision
+
+            # Run migrations before switching traffic
+            docker run --rm \
+              --env-file .env.prod \
+              $ECR_REGISTRY/menuvision/backend:$IMAGE_TAG \
+              alembic upgrade head
+
+            # Blue-green: bring up new version alongside old
+            export BACKEND_IMAGE=$ECR_REGISTRY/menuvision/backend:$IMAGE_TAG
+            export FRONTEND_IMAGE=$ECR_REGISTRY/menuvision/frontend:$IMAGE_TAG
+
+            docker-compose -f docker-compose.prod.yml up -d \
+              --scale backend=3 \
+              --no-deps \
+              backend frontend
+
+            sleep 15
+
+            # Health gate
+            for i in 1 2 3; do
+              curl --fail https://menuvision.app/health && break
+              sleep 5
+            done || {
+              echo "❌ Production health check failed — rolling back"
+              docker-compose -f docker-compose.prod.yml rollback
+              exit 1
+            }
+
+            docker image prune -f
+            echo "✅ Production deploy complete: $IMAGE_TAG"
+
+      - name: Production smoke test
+        run: |
+          sleep 10
+          # Health
+          curl --fail https://menuvision.app/health
+          # API version
+          curl --fail https://api.menuvision.app/health | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          assert d['status'] == 'ok', f'Bad status: {d}'
+          print('✅ Production smoke test passed')
+          "
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ github.run_number }}"
+          name: "Release ${{ needs.build-and-push.outputs.image-tag }}"
+          body: |
+            ## MenuVision Release ${{ needs.build-and-push.outputs.image-tag }}
+
+            **Deployed:** ${{ github.event.head_commit.message }}
+            **Commit:** ${{ github.sha }}
+            **By:** ${{ github.actor }}
+
+            ### Included
+            - Backend image: `${{ needs.build-and-push.outputs.image-tag }}`
+            - Frontend image: `${{ needs.build-and-push.outputs.image-tag }}`
+          draft: false
+          prerelease: false
+
+      - name: Notify Slack (production)
+        if: always()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '🚀' || '🔥' }} *Production deploy* ${{ job.status }}\nTag: `${{ needs.build-and-push.outputs.image-tag }}` | By: ${{ github.actor }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

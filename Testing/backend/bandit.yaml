@@ -1,0 +1,7 @@
+skips:
+  - B101  # assert used in tests (fine in test files)
+  - B601  # paramiko shell=True (not used)
+exclude_dirs:
+  - tests
+  - .venv
+  - alembic

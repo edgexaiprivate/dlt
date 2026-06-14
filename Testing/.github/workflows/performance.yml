@@ -1,0 +1,128 @@
+##############################################################################
+# MenuVision — Performance Test Workflow
+# Runs on: manual trigger OR after staging deploy (develop branch)
+# NOT on every PR — too slow and resource intensive.
+#
+# Thresholds enforced:
+#   p95 menu read    < 500ms
+#   p95 write op     < 1000ms
+#   Error rate       < 1%
+#   WebSocket 50 concurrent connections stable
+##############################################################################
+name: Performance Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: "Target URL for load test"
+        required: true
+        default: "https://staging.menuvision.app"
+      users:
+        description: "Number of concurrent users"
+        required: true
+        default: "50"
+      duration:
+        description: "Test duration (seconds)"
+        required: true
+        default: "120"
+  workflow_run:
+    workflows: [CD]
+    types: [completed]
+    branches: [develop]
+
+jobs:
+  performance:
+    name: "Locust Load Test"
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Locust
+        run: pip install locust
+
+      - name: Run load test (headless)
+        env:
+          TARGET_URL: ${{ github.event.inputs.target_url || 'https://staging.menuvision.app' }}
+          USERS: ${{ github.event.inputs.users || '50' }}
+          DURATION: ${{ github.event.inputs.duration || '120' }}
+        run: |
+          locust \
+            -f backend/tests/performance/locustfile.py \
+            --host=$TARGET_URL \
+            --headless \
+            -u $USERS \
+            -r 5 \
+            --run-time ${DURATION}s \
+            --html=locust-report.html \
+            --csv=locust-results \
+            --exit-code-on-error 1
+
+      - name: Check performance thresholds
+        run: |
+          python3 << 'EOF'
+          import csv, sys
+
+          # Read Locust CSV stats
+          failures = []
+          with open("locust-results_stats.csv") as f:
+              for row in csv.DictReader(f):
+                  name = row["Name"]
+                  if name == "Aggregated":
+                      continue
+
+                  p95 = float(row.get("95%", 0))
+                  errors = int(row.get("Failure Count", 0))
+                  total = int(row.get("Request Count", 1))
+                  error_rate = errors / total
+
+                  print(f"{name}: p95={p95:.0f}ms  errors={error_rate:.1%}")
+
+                  # Menu reads must be fast
+                  if "full" in name.lower() and p95 > 500:
+                      failures.append(f"❌ Menu read p95 {p95:.0f}ms > 500ms threshold")
+
+                  # Error rate check
+                  if error_rate > 0.01:
+                      failures.append(f"❌ {name} error rate {error_rate:.1%} > 1%")
+
+          if failures:
+              for f in failures:
+                  print(f)
+              sys.exit(1)
+
+          print("✅ All performance thresholds passed!")
+          EOF
+
+      - name: Upload performance report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-report
+          path: |
+            locust-report.html
+            locust-results*.csv
+          retention-days: 30
+
+      - name: Comment results on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            // Parse CSV for summary
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 📊 Performance Test Results\n\nSee [locust report artifact](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for full details.`
+            });

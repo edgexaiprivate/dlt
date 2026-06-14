@@ -1,0 +1,16 @@
+fastapi==0.136.3
+uvicorn[standard]
+sqlalchemy[asyncio]
+asyncpg
+alembic
+pydantic[email]
+pydantic-settings
+bcrypt
+python-jose[cryptography]==3.5.0
+python-multipart==0.0.29
+redis==7.4.0
+httpx==0.28.1
+Pillow==12.2.0
+pytest==9.0.3
+pytest-asyncio==1.4.0
+python-slugify==8.0.4
